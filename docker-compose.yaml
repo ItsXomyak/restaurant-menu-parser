@@ -1,8 +1,176 @@
-version: '3'
+version: '3.8'
+
+networks:
+  menu-parser-network:
+    driver: bridge
+
+volumes:
+  mongodb_data:
+
 services:
-  app:
-    container_name: "{$PROJECT_NAME}"
-    build: .
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: menu_parser_api
+    command: './api'
+    ports:
+      - '${HTTP_PORT:-8080}:8080'
+    depends_on:
+      mongo_init:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
     env_file:
       - .env
+    environment:
+      MONGO_URI: 'mongodb://${MONGO_USER:-admin}:${MONGO_PASS:-password}@mongodb:27017/${MONGO_DB_NAME:-menu_parser}?authSource=admin&replicaSet=rs0'
+      RABBIT_URI: 'amqp://${RABBIT_USER:-guest}:${RABBIT_PASS:-guest}@rabbitmq:5672/'
+      ENV: '${ENV}'
+      LOGGER_LEVEL: '${LOGGER_LEVEL}'
+      GOOGLE_SERVICE_ACCOUNT_JSON: '${GOOGLE_SERVICE_ACCOUNT_JSON}'
+    networks:
+      - menu-parser-network
+    restart: on-failure
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'wget',
+          '--quiet',
+          '-O',
+          '/dev/null',
+          'http://localhost:8080/api/v1/health',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: menu_parser_worker
+    command: './worker'
+    depends_on:
+      mongo_init:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      MONGO_URI: 'mongodb://${MONGO_USER:-admin}:${MONGO_PASS:-password}@mongodb:27017/${MONGO_DB_NAME:-menu_parser}?authSource=admin&replicaSet=rs0'
+      RABBIT_URI: 'amqp://${RABBIT_USER:-guest}:${RABBIT_PASS:-guest}@rabbitmq:5672/'
+      ENV: '${ENV}'
+      LOGGER_LEVEL: '${LOGGER_LEVEL}'
+      GOOGLE_SERVICE_ACCOUNT_JSON: '${GOOGLE_SERVICE_ACCOUNT_JSON}'
+    networks:
+      - menu-parser-network
+    restart: on-failure
+    healthcheck:
+      test: ['CMD', 'pgrep', '-f', './worker']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  mongodb:
+    image: mongo:6.0
+    container_name: menu_parser_db
+    # Запускаем БЕЗ авторизации и БЕЗ keyFile для одноузлового replica set
+    command: ['mongod', '--replSet', 'rs0', '--bind_ip_all']
+    ports:
+      - '${MONGO_PORT_HOST:-27017}:27017'
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - menu-parser-network
     restart: always
+    healthcheck:
+      test: ['CMD', 'mongosh', '--eval', "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: menu_parser_mq
+    ports:
+      - '${RABBIT_PORT_HOST:-5672}:5672'
+      - '${RABBIT_MGMT_PORT_HOST:-15672}:15672'
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBIT_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBIT_PASS:-guest}
+    networks:
+      - menu-parser-network
+    restart: always
+    healthcheck:
+      test: ['CMD', 'rabbitmq-diagnostics', 'check_port_connectivity']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mongo_init:
+    image: mongo:6.0
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    networks:
+      - menu-parser-network
+    restart: 'no'
+    entrypoint: []
+    command: |
+      /bin/bash -c "
+      echo '⏳ Waiting for MongoDB to be ready...';
+      until mongosh --host mongodb --eval 'db.runCommand({ ping: 1 })' &>/dev/null; do
+        echo 'Waiting...';
+        sleep 2;
+      done;
+
+      echo '🚀 Initiating Replica Set...';
+      mongosh --host mongodb --eval '
+        try {
+          var status = rs.status();
+          print(\"✓ Replica set already initialized\");
+        } catch(e) {
+          rs.initiate({
+            _id: \"rs0\",
+            members: [{ _id: 0, host: \"mongodb:27017\" }]
+          });
+          print(\"✓ Replica set initialized\");
+        }
+      ';
+
+      echo '⏳ Waiting for replica set to become primary...';
+      until mongosh --host mongodb --eval 'rs.status().members[0].stateStr' | grep -q PRIMARY; do
+        echo 'Waiting for PRIMARY state...';
+        sleep 2;
+      done;
+
+      echo '🔐 Creating Admin User...';
+      mongosh --host mongodb --eval '
+        var adminDb = db.getSiblingDB(\"admin\");
+        try {
+          adminDb.auth(\"${MONGO_USER:-admin}\", \"${MONGO_PASS:-password}\");
+          print(\"✓ User already exists and authenticated\");
+        } catch(e) {
+          try {
+            adminDb.createUser({
+              user: \"${MONGO_USER:-admin}\",
+              pwd: \"${MONGO_PASS:-password}\",
+              roles: [
+                { role: \"root\", db: \"admin\" }
+              ]
+            });
+            print(\"✓ User created successfully\");
+          } catch(err) {
+            print(\"Note: User might already exist\");
+          }
+        }
+      ';
+
+      echo '✅ MongoDB Setup Complete - Ready for transactions!';
+      "
